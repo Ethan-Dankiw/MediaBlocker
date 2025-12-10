@@ -101,7 +101,7 @@ async fn monitor_media_players(channel_notifier: ProducerChannel) -> Result<()> 
 
         // Send a signal to Task 2 to rebuild its list of media players
         match channel_notifier.send(()).await {
-            Ok(e) => {
+            Ok(_) => {
                 eprintln!("[DISCOVERY] Playback monitor has been notified of detected changes")
             },
             Err(e) => {
