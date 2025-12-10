@@ -1,4 +1,5 @@
 use async_std::stream::Stream;
+use futures::stream::SelectAll;
 
 // Paths to DBus object
 pub const DBUS_DESTINATION: &str = "org.freedesktop.DBus";
@@ -16,6 +17,9 @@ pub const SCREENSAVER_INTERFACE: &str = "org.freedesktop.ScreenSaver";
 
 // Type alias for the stream of D-Bus messages
 pub type DbusSignalStream = std::pin::Pin<Box<dyn Stream<Item = zbus::Message> + Send>>;
+
+// Type alias for a set of all streams
+pub type UnifiedStream = SelectAll<DbusSignalStream>;
 
 // Struct to indicate to the consumer which action to perform (addition/removal of a player)
 pub type MediaPlayerListChangeSignal = ();
