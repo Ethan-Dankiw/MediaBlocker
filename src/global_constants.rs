@@ -20,12 +20,3 @@ pub type DbusSignalStream = std::pin::Pin<Box<dyn Stream<Item = zbus::Message> +
 
 // Type alias for a set of all streams
 pub type UnifiedStream = SelectAll<DbusSignalStream>;
-
-// Struct to indicate to the consumer which action to perform (addition/removal of a player)
-pub type MediaPlayerListChangeSignal = ();
-
-// Type alias for the producer channel
-pub type ProducerChannel = async_std::channel::Sender<MediaPlayerListChangeSignal>;
-
-// Type alias for the consumer channel
-pub type ConsumerChannel = async_std::channel::Receiver<MediaPlayerListChangeSignal>;

@@ -1,177 +1,276 @@
+mod app;
 mod global_constants;
-mod media_player;
-mod screen_blocking;
 mod utils;
-mod application;
 
-use crate::global_constants::{
-    ConsumerChannel, MediaPlayerListChangeSignal, ProducerChannel, UnifiedStream,
-};
-use crate::media_player::get_media_player_streams;
-use crate::screen_blocking::update_blocking_state;
-use crate::utils::is_media_player;
+use crate::app::application::Application;
 use anyhow::Result;
 use async_std::task;
-use futures::stream::select_all;
-use futures::StreamExt;
-use zbus::fdo::DBusProxy;
-use zbus::Connection;
+use directories::ProjectDirs;
+use log::LevelFilter;
+use simplelog::{ColorChoice, Config, TermLogger, TerminalMode, WriteLogger};
+use std::fs::File;
+use std::sync::Arc;
+use std::thread;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{TrayIconBuilder, Icon};
+
+// Define a custom event type to wake up the loop
+enum UserEvent {
+    MenuEvent(MenuEvent),
+    RefreshIcon
+}
+
+// Struct to hold our loaded icons so we don't reload them from disk constantly
+struct IconPack {
+    active: Icon,
+    inactive: Icon,
+    blocked: Icon,
+}
 
 fn main() -> Result<()> {
-    // Handle the execution of main asynchronously
-    task::block_on(async_main())
-}
-
-async fn async_main() -> Result<()> {
-    // Establish a connection to the D-Bus interface in linux
-    let conn = Connection::session().await?;
-
-    // Open a channel for producer/consumer of monitored media players
-    let (producer, consumer) = async_std::channel::unbounded::<MediaPlayerListChangeSignal>();
-
-    // Monitor the additional/removal of media players from the D-Bus
-    println!("[SYSTEM] Spawning task to monitor addition/removal of media players...");
-    let monitor_players_task = task::spawn(monitor_media_players(conn.clone(), producer));
-
-    // Monitor the playback status of active media players
-    println!("[SYSTEM] Spawning task to monitor playback status of active media players...");
-    let monitor_playback_task = task::spawn(monitor_playback_status(conn.clone(), consumer));
-
-    // Wait for both tasks to finish
-    futures::future::join_all(vec![monitor_players_task, monitor_playback_task]).await;
-    Ok(())
-}
-
-async fn monitor_media_players(conn: Connection, channel_notifier: ProducerChannel) -> Result<()> {
-    // Create a proxy for the D-Bus interface
-    let dbus: DBusProxy = DBusProxy::new(&conn).await?;
-
-    // Receive all the signals matching the added rule
-    let mut signal_stream = dbus.receive_name_owner_changed().await?;
-
-    // Log that the service is monitoring for media player signals
-    println!("[DISCOVERY] Media Player discovery service started");
-
-    // Process the signals
-    while let Some(signal) = signal_stream.next().await {
-        // Deserialize the message arguments into the three known NameOwnerChanged strings.
-        let args = match signal.args() {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("[DISCOVERY] Failed to deserialize signal arguments: {}", e);
-                continue;
-            }
-        };
-
-        // If the name of the signal is not for a media player
-        let service_name = args.name;
-        if !is_media_player(&service_name) {
-            // Ignore non-media services
-            continue;
-        }
-
-        // Log that a change has been detected
-        println!("[DISCOVERY] Detected change in list of media players");
-
-        // Extract the old and new owners of the service
-        let old_owner = args.old_owner;
-        let new_owner = args.new_owner;
-
-        // Log the action that is taken for the changed list
-        if old_owner.is_none() && new_owner.is_some() {
-            println!("[DISCOVERY] {} has been added", service_name);
-        } else if old_owner.is_some() && new_owner.is_none() {
-            println!("[DISCOVERY] {} has been removed", service_name);
-        }
-
-        // Send a signal to Task 2 to rebuild its list of media players
-        match channel_notifier.send(()).await {
-            Ok(_) => {
-                eprintln!("[DISCOVERY] Playback monitor has been notified of detected changes")
-            }
-            Err(e) => {
-                eprintln!(
-                    "[DISCOVERY] Failed to notify playback monitor of detected changes: {}",
-                    e
-                );
-                break;
-            }
-        }
+    // This initializes the GTK backend required by the tray-icon crate
+    if let Err(e) = gtk::init() {
+        eprintln!("Failed to initialize GTK: {}", e);
+        return Err(anyhow::anyhow!("Failed to initialize GTK"));
     }
 
-    Ok(())
-}
+    // Setup logging to a log file
+    log::debug!("[SYSTEM] Setting up log file...");
+    let _log_path = setup_logging()?;
 
-async fn monitor_playback_status(
-    conn: Connection,
-    mut channel_notifier: ConsumerChannel,
-) -> Result<()> {
-    // Define a mutable variable for if the screen is currently being blocked
-    let mut is_screen_blocked = false;
+    // Create the Application state (Async)
+    log::debug!("[SYSTEM] Initializing application state...");
+    let app = task::block_on(Application::new())?;
 
-    // Initialise the stream with an initial state
-    let mut unified_stream = update_streams_and_state(&conn, &mut is_screen_blocked).await?;
+    // Wrap the application state in ARC
+    let app = Arc::new(app);
+    log::info!("[SYSTEM] Application state initialized successfully");
 
-    // Log that the service is monitoring for playback changes in media players
-    println!("[PLAYBACK] Media Playback monitor service started");
+    // Create a clone of the app for the background process
+    let app_worker = app.clone();
 
-    loop {
-        // If the list of media player streams is empty
-        if unified_stream.is_empty() {
-            // If no players are found, wait ONLY for the next notification from Task 1
-            println!(
-                "[PLAYBACK] No active media players found, waiting until nest media player notification..."
-            );
+    // Spawn a new thread to manage the background processing of media players, and playback state
+    log::debug!("[SYSTEM] Spawning background worker thread...");
+    thread::spawn(move || {
+        task::block_on(async {
+            app_worker.run().await;
+        });
+    });
 
-            // Wait for the list of media players to update
-            if channel_notifier.next().await.is_none() {
-                // If the channel has been closed
-                return Ok(());
+    // Building the event loop for system tray interactions
+    log::debug!("[EVENT LOOP] Building menu event loop...");
+
+    // Create an event loop for the system tray menu
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    // Create a proxy to send events from the tray handler to the menu event loop
+    let menu_proxy= event_loop.create_proxy();
+    let ui_proxy = menu_proxy.clone();
+
+    // Register the menu event handler
+    MenuEvent::set_event_handler(Some(move |event| {
+        let _ = menu_proxy.send_event(UserEvent::MenuEvent(event));
+    }));
+
+    // Listen for UI updates and forward them to the event loop
+    let ui_consumer = app.get_ui_channel().get_consumer();
+    thread::spawn(move || {
+        task::block_on(async {
+            // Wait for messes from the playback monitor
+            while let Ok(_) = ui_consumer.recv().await {
+                // Wait up the main thread with a RefreshIcon event
+                let _ = ui_proxy.send_event(UserEvent::RefreshIcon);
             }
+        })
+    });
 
-            // Updated the unified set of streams
-            unified_stream = update_streams_and_state(&conn, &mut is_screen_blocked).await?;
-            continue;
-        }
+    // Log that the event loop has been registered
+    log::info!("[EVENT LOOP] Menu event loop proxy registered successfully");
 
-        // Wait for the next signal, either for new media players or playback status change
-        futures::select! {
-            // If a new media player was added/removed from Task 1
-            _ = channel_notifier.next() => {
-                // If no players are found, wait ONLY for the next notification from Task 1
-                println!("[PLAYBACK] Received discovery signal, refreshing list of media players...");
+    // Build the system tray menu
+    log::debug!("[TRAY MENU] Creating system tray menu items...");
 
-                // Updated the unified set of streams
-                unified_stream = update_streams_and_state(&conn, &mut is_screen_blocked).await?;
-            },
+    // Toggle for blocking screensaver updates
+    let toggle_item = CheckMenuItem::new("Blocker Enabled", true, true, None);
 
-            // If the playback status changed for an active player
-            result = unified_stream.next() => {
-                // If no media players were found
-                if result.is_none() {
-                    continue;
+    // Button to open the logs file
+    let logs_item = MenuItem::new("Open Logs", true, None);
+
+    // Button for closing the application
+    let quit_item = MenuItem::new("Quit", true, None);
+
+    // Create a menu for the system tray that contains the above buttons
+    let tray_menu = Menu::new();
+    tray_menu.append_items(&[
+        &toggle_item,
+        &PredefinedMenuItem::separator(),
+        &logs_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+    ])?;
+    log::info!("[TRAY MENU] System tray menu created successfully");
+
+    // Create a system tray icon
+    log::debug!("[TRAY ICON] Building system tray icon...");
+
+    // Load the icon directory
+    let icon_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/icons"));
+
+    // Load the icons from the icon directory
+    let active_icon = load_tray_icon(&icon_dir.join("active.png"));
+    let inactive_icon = load_tray_icon(&icon_dir.join("inactive.png"));
+    let blocked_icon = load_tray_icon(&icon_dir.join("blocked.png"));
+
+    // Define the icon pack
+    let icons = IconPack {
+        active: active_icon,
+        inactive: inactive_icon.clone(),
+        blocked: blocked_icon,
+    };
+
+    // Define ths system tray icon + menu
+    let tray_icon = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("Media Blocker")
+        .with_title("MediaBlocker")
+        .with_icon(inactive_icon.clone())
+        .build()?;
+
+    // Log that the system tray icon was created successfully
+    log::info!("[TRAY ICON] System tray icon created successfully");
+
+    // Get the producer channel for the system tray
+    let tray_producer = app.get_tray_channel().get_producer();
+
+    // Start the event loop for the system tray menu
+    log::info!("[EVENT LOOP] Starting main event loop...");
+    event_loop.run(move |event, _, control_flow| {
+        // When loop iteration completes, wait until next event
+        *control_flow = ControlFlow::Wait;
+
+        // Receive an event from the menu
+        match event {
+            // Handle UI refresh requests
+            tao::event::Event::UserEvent(UserEvent::RefreshIcon) => {
+                // Get the flags for if the screensaver's blocked/unblocked state can be updated
+                let updates_allowed = app.get_screensaver().are_updates_allowed();
+
+                // If updates are not allowed
+                if !updates_allowed {
+                    // Update the icon to be in the blocked state
+                    let _ = tray_icon.set_icon(Some(icons.blocked.clone()));
+                    return;
                 }
 
-                // If a media player exists, then update the state to match the changed playback state
-                update_blocking_state(&conn, &mut is_screen_blocked).await?;
-            },
+                // Get the flag for if the screensave is currently being blocked
+                let is_screensaver_blocked = app.get_screensaver().is_blocked();
+
+                // If the screensaver is currently being blocked
+                if is_screensaver_blocked {
+                    // Update the icon to be in the active state
+                    let _ = tray_icon.set_icon(Some(icons.active.clone()));
+                } else {
+                    // Update the icon to be in the inactive state
+                    let _ = tray_icon.set_icon(Some(icons.inactive.clone()));
+                }
+            }
+
+            // Handle menu item clicks
+            tao::event::Event::UserEvent(UserEvent::MenuEvent(menu_event)) => {
+                // If the event is to exit the system try
+                if menu_event.id == quit_item.id() {
+                    log::info!("[SYSTEM TRAY] Quit request received. Exiting application...");
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+
+                // If the event is to toggle the allowing/disallowing of screensaver updates
+                if menu_event.id == toggle_item.id() {
+                    // Get the opposite state to indicate a toggle
+                    let next_state = !app.get_screensaver().are_updates_allowed();
+
+                    log::info!(
+                        "[SYSTEM TRAY] Toggle request received. New state: {}",
+                        if next_state { "ENABLED" } else { "DISABLED" }
+                    );
+
+                    // Update the state of the screensaver to match the system tray state
+                    if next_state {
+                        app.get_screensaver().allow_updates();
+                        let _ = tray_icon.set_icon(Some(icons.active.clone()));
+                        log::debug!("[SYSTEM TRAY] Screensaver updates allowed.");
+                    } else {
+                        app.get_screensaver().disallow_updates();
+                        let _ = tray_icon.set_icon(Some(icons.inactive.clone()));
+                        log::debug!("[SYSTEM TRAY] Screensaver updates disallowed.");
+                    }
+
+                    // Notify the background worker to adjust state accordingly
+                    log::debug!("[SYSTEM TRAY] Sending refresh signal to background worker...");
+                    if let Err(e) = task::block_on(tray_producer.send(())) {
+                        log::error!("[SYSTEM TRAY] Failed to send signal to worker: {}", e);
+                    }
+                    return;
+                }
+
+                // If the event is to open the log file
+                if menu_event.id == logs_item.id() {
+                    log::error!("[SYSTEM TRAY] Opening logs button is not a defined action");
+                    return;
+                }
+            }
+            _ => {}
         }
+    });
+}
+
+fn setup_logging() -> Result<std::path::PathBuf> {
+    // Match on the state for the parsing of the project directory
+    match ProjectDirs::from("com", "MediaBlocker", "MediaBlocker") {
+        Some(proj_dirs) => {
+            // Get the log directory
+            let log_dir = proj_dirs.data_dir();
+
+            // Recursively create the log directory and any parents
+            std::fs::create_dir_all(log_dir)?;
+
+            // Get the log file
+            let log_file = log_dir.join("media_blocker.log");
+
+            // Create the logger
+            simplelog::CombinedLogger::init(vec![
+                TermLogger::new(
+                    LevelFilter::Warn,
+                    Config::default(),
+                    TerminalMode::Mixed,
+                    ColorChoice::Auto,
+                ),
+                WriteLogger::new(
+                    LevelFilter::Warn,
+                    Config::default(),
+                    File::create(&log_file)?,
+                ),
+            ])?;
+
+            // Return the log file
+            Ok(log_file)
+        }
+        None => Err(anyhow::anyhow!("Failed to detect project directory")),
     }
 }
 
-async fn update_streams_and_state(
-    conn: &Connection,
-    is_screen_blocked: &mut bool,
-) -> Result<UnifiedStream> {
-    // Get an updated list of streams
-    let new_streams = get_media_player_streams(&conn).await?;
+fn load_tray_icon(path: &std::path::Path) -> Icon {
+    // Load from file
+    let (icon_rgba, icon_width, icon_height) = {
+        let image = image::open(path)
+            .expect("Failed to open icon path")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        (rgba, width, height)
+    };
 
-    // Update the unified set of streams with the new list
-    let unified_stream = select_all(new_streams);
-
-    // Update the blocking state to the current state
-    update_blocking_state(&conn, is_screen_blocked).await?;
-
-    // Return the unified set of streams
-    Ok(unified_stream)
+    // Create icon from RGBA values
+    Icon::from_rgba(icon_rgba, icon_width, icon_height).expect("Failed to load icon")
 }
