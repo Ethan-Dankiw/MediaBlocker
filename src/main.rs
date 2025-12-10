@@ -2,6 +2,7 @@ mod global_constants;
 mod media_player;
 mod screen_blocking;
 mod utils;
+mod application;
 
 use crate::global_constants::{
     ConsumerChannel, MediaPlayerListChangeSignal, ProducerChannel, UnifiedStream,
