@@ -23,7 +23,7 @@ enum UserEvent {
     RefreshIcon
 }
 
-// Struct to hold our loaded icons so we don't reload them from disk constantly
+// Struct to hold our loaded tray_icons so we don't reload them from disk constantly
 struct IconPack {
     active: Icon,
     inactive: Icon,
@@ -125,9 +125,9 @@ fn main() -> Result<()> {
     log::debug!("[TRAY ICON] Building system tray icon...");
 
     // Load the icon directory
-    let icon_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/icons"));
+    let icon_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/public/tray_icons"));
 
-    // Load the icons from the icon directory
+    // Load the tray_icons from the icon directory
     let icons = IconPack {
         active: load_tray_icon(&icon_dir.join("active.png")),
         inactive: load_tray_icon(&icon_dir.join("inactive.png")),
