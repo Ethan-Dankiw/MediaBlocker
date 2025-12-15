@@ -3,6 +3,10 @@ name = "MediaBlocker"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+split-debuginfo = 'off'
+
 [dependencies]
 zbus = "5.12.0"
 zvariant = "5.8.0"

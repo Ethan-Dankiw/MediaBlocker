@@ -1,6 +1,7 @@
 mod app;
 mod global_constants;
 mod utils;
+mod ui;
 
 use crate::app::application::Application;
 use anyhow::Result;
@@ -12,8 +13,9 @@ use std::fs::File;
 use std::sync::Arc;
 use std::thread;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{MenuEvent};
 use tray_icon::{TrayIconBuilder, Icon};
+use crate::ui::system_tray::SystemTrayBuilder;
 
 // Define a custom event type to wake up the loop
 enum UserEvent {
@@ -26,6 +28,14 @@ struct IconPack {
     active: Icon,
     inactive: Icon,
     blocked: Icon,
+}
+
+// Enum to track the current visual state of the icon
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum AppIconState {
+    Active,
+    Inactive,
+    Blocked,
 }
 
 fn main() -> Result<()> {
@@ -88,27 +98,27 @@ fn main() -> Result<()> {
     // Log that the event loop has been registered
     log::info!("[EVENT LOOP] Menu event loop proxy registered successfully");
 
-    // Build the system tray menu
+    // Create a system tray builder
     log::debug!("[TRAY MENU] Creating system tray menu items...");
+    let mut tray_builder = SystemTrayBuilder::new();
 
-    // Toggle for blocking screensaver updates
-    let toggle_item = CheckMenuItem::new("Blocker Enabled", true, true, None);
+    // Create the toggle checkbox menu item for blocking screensaver updates
+    let toggle_id = tray_builder.create_check_menu_item("Blocker Enabled", true);
 
-    // Button to open the logs file
-    let logs_item = MenuItem::new("Open Logs", true, None);
+    // Add a separator
+    tray_builder.create_separator();
 
-    // Button for closing the application
-    let quit_item = MenuItem::new("Quit", true, None);
+    // Create the button to open the logs file
+    let logs_id = tray_builder.create_menu_item("Open Logs");
 
-    // Create a menu for the system tray that contains the above buttons
-    let tray_menu = Menu::new();
-    tray_menu.append_items(&[
-        &toggle_item,
-        &PredefinedMenuItem::separator(),
-        &logs_item,
-        &PredefinedMenuItem::separator(),
-        &quit_item,
-    ])?;
+    // Add a separator
+    tray_builder.create_separator();
+
+    // Create the button to quit the application
+    let quit_id = tray_builder.create_menu_item("Quit");
+
+    // Build the menu
+    let tray_menu = tray_builder.build();
     log::info!("[TRAY MENU] System tray menu created successfully");
 
     // Create a system tray icon
@@ -118,15 +128,10 @@ fn main() -> Result<()> {
     let icon_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/icons"));
 
     // Load the icons from the icon directory
-    let active_icon = load_tray_icon(&icon_dir.join("active.png"));
-    let inactive_icon = load_tray_icon(&icon_dir.join("inactive.png"));
-    let blocked_icon = load_tray_icon(&icon_dir.join("blocked.png"));
-
-    // Define the icon pack
     let icons = IconPack {
-        active: active_icon,
-        inactive: inactive_icon.clone(),
-        blocked: blocked_icon,
+        active: load_tray_icon(&icon_dir.join("active.png")),
+        inactive: load_tray_icon(&icon_dir.join("inactive.png")),
+        blocked: load_tray_icon(&icon_dir.join("blocked.png")),
     };
 
     // Define ths system tray icon + menu
@@ -134,8 +139,11 @@ fn main() -> Result<()> {
         .with_menu(Box::new(tray_menu))
         .with_tooltip("Media Blocker")
         .with_title("MediaBlocker")
-        .with_icon(inactive_icon.clone())
+        .with_icon(icons.inactive.clone())
         .build()?;
+
+    // Define the current icon state
+    let mut current_icon_state = AppIconState::Inactive;
 
     // Log that the system tray icon was created successfully
     log::info!("[TRAY ICON] System tray icon created successfully");
@@ -153,40 +161,41 @@ fn main() -> Result<()> {
         match event {
             // Handle UI refresh requests
             tao::event::Event::UserEvent(UserEvent::RefreshIcon) => {
-                // Get the flags for if the screensaver's blocked/unblocked state can be updated
-                let updates_allowed = app.get_screensaver().are_updates_allowed();
+                // Determine the state of the app icon
+                let new_icon_state = determine_app_icon_state(app.clone());
 
-                // If updates are not allowed
-                if !updates_allowed {
-                    // Update the icon to be in the blocked state
-                    let _ = tray_icon.set_icon(Some(icons.blocked.clone()));
+                // If the state has not changes
+                if new_icon_state == current_icon_state {
+                    // No need to refresh the icon
                     return;
                 }
 
-                // Get the flag for if the screensave is currently being blocked
-                let is_screensaver_blocked = app.get_screensaver().is_blocked();
+                // Match on the new app icon state
+                let new_icon = match new_icon_state {
+                    AppIconState::Active => &icons.active,
+                    AppIconState::Inactive => &icons.inactive,
+                    AppIconState::Blocked => &icons.blocked,
+                };
 
-                // If the screensaver is currently being blocked
-                if is_screensaver_blocked {
-                    // Update the icon to be in the active state
-                    let _ = tray_icon.set_icon(Some(icons.active.clone()));
-                } else {
-                    // Update the icon to be in the inactive state
-                    let _ = tray_icon.set_icon(Some(icons.inactive.clone()));
-                }
+                // Set the tray icon to be the new icon
+                let _ = tray_icon.set_icon(Some(new_icon.clone()));
+
+                // Set the current icon to be the new icon
+                current_icon_state = new_icon_state;
+                log::trace!("[TRAY MENU] New icon: {:?}", new_icon_state);
             }
 
             // Handle menu item clicks
             tao::event::Event::UserEvent(UserEvent::MenuEvent(menu_event)) => {
                 // If the event is to exit the system try
-                if menu_event.id == quit_item.id() {
+                if menu_event.id == quit_id {
                     log::info!("[SYSTEM TRAY] Quit request received. Exiting application...");
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
 
                 // If the event is to toggle the allowing/disallowing of screensaver updates
-                if menu_event.id == toggle_item.id() {
+                if menu_event.id == toggle_id {
                     // Get the opposite state to indicate a toggle
                     let next_state = !app.get_screensaver().are_updates_allowed();
 
@@ -198,11 +207,9 @@ fn main() -> Result<()> {
                     // Update the state of the screensaver to match the system tray state
                     if next_state {
                         app.get_screensaver().allow_updates();
-                        let _ = tray_icon.set_icon(Some(icons.active.clone()));
                         log::debug!("[SYSTEM TRAY] Screensaver updates allowed.");
                     } else {
                         app.get_screensaver().disallow_updates();
-                        let _ = tray_icon.set_icon(Some(icons.inactive.clone()));
                         log::debug!("[SYSTEM TRAY] Screensaver updates disallowed.");
                     }
 
@@ -215,7 +222,7 @@ fn main() -> Result<()> {
                 }
 
                 // If the event is to open the log file
-                if menu_event.id == logs_item.id() {
+                if menu_event.id == logs_id {
                     log::error!("[SYSTEM TRAY] Opening logs button is not a defined action");
                     return;
                 }
@@ -223,6 +230,33 @@ fn main() -> Result<()> {
             _ => {}
         }
     });
+}
+
+fn determine_app_icon_state(app: Arc<Application>) -> AppIconState {
+    // Get the screensaver from the app
+    let screensaver = app.get_screensaver();
+
+    // Get the flags for if the screensaver's blocked/unblocked state can be updated
+    let updates_allowed = screensaver.are_updates_allowed();
+
+    // If updates are not allowed
+    if !updates_allowed {
+        // Update the icon to be in the blocked state
+        return AppIconState::Blocked;
+    }
+
+    // Get the flag for if the screensave is currently being blocked
+    let is_screensaver_blocked = screensaver.is_blocked();
+
+    // If the screensaver is currently being blocked
+    if is_screensaver_blocked {
+        // Update the icon to be in the active state
+        return AppIconState::Active;
+    }
+
+    // In the screensaver is not currently being blocked
+    // Update the icon to be in the inactive state
+    AppIconState::Inactive
 }
 
 fn setup_logging() -> Result<std::path::PathBuf> {
