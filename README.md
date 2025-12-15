@@ -5,6 +5,10 @@ I do not intend for this to work on a machine other than mine, so I cannot provi
 security, reliability or compatability that the code works on your machine as expected and does not break anything
 if downloaded and executed.
 
+# System Requirements
+
+APP may require Arch based OS and KDE Plasma desktop environment, however this is unverified.
+
 # Design Goal
 
 When actively playing a video or listening to music in the background as my computer's only task,
@@ -29,7 +33,8 @@ Turns out the answer is a resounding YES!!!
 # High Level Overview
 
 1. Registers a listener and waits for a signal/interrupt on any added/removed media players (e.g. Spotify, Chrome, VLC)
-2. Registers a listener for each of the media players and waits for a signal/interrupt on any changes in their playback status (Playing, Paused,
+2. Registers a listener for each of the media players and waits for a signal/interrupt on any changes in their playback
+   status (Playing, Paused,
    Stopped)
 3. If any media player is current playing, then block the screensaver from sleeping the PC
 4. Otherwise, allow the screensaver to auto-sleep the PC
